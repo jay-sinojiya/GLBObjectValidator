@@ -1,0 +1,30 @@
+{
+  "name": "object-validation-tool",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@babylonjs/core": "^8.17.1",
+    "@babylonjs/gui": "^8.17.1",
+    "@babylonjs/loaders": "^8.17.1",
+    "@babylonjs/materials": "^8.17.1",
+    "@babylonjs/serializers": "^8.56.2",
+    "jszip": "^3.10.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
+    "@vitejs/plugin-react": "^4.5.2",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5",
+    "vitest": "^3.2.4"
+  }
+}
