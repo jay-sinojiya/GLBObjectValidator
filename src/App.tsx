@@ -189,7 +189,7 @@ export function App() {
           </div>
           <p className="hint">
             {ready
-              ? `Source ${snap.frontFaceSource} · confidence ${(snap.confidence * 100).toFixed(0)}%. Selection is metadata only — the GLB yaw is not baked.`
+              ? `Source ${snap.frontFaceSource} · confidence ${(snap.confidence * 100).toFixed(0)}%. The lit button is the side that gets turned onto +Z. +Z itself does not rotate.`
               : "Upload a model to detect a front axis."}
           </p>
         </section>
@@ -245,15 +245,23 @@ export function App() {
         </section>
 
         <section className="export">
-          <button type="button" disabled={!snap.validated} onClick={() => void labRef.current?.saveConfiguration()}>
-            Save Object Configuration
+          <button type="button" disabled={!ready} onClick={() => labRef.current?.saveAxis()}>
+            Save
           </button>
-          <button type="button" className="primary" disabled={!snap.validated} onClick={() => void labRef.current?.exportPackage()}>
-            Export Validated Object
+          <button
+            type="button"
+            className="primary"
+            disabled={!ready || !snap.axisSaved || snap.downloading}
+            onClick={() => void labRef.current?.downloadGlb()}
+          >
+            {snap.downloading ? "Downloading…" : "Download"}
           </button>
           <p className="hint">
-            Package is <code>object.glb</code> + <code>object.json</code>. Front axis stays in the JSON. The planner should
-            read <code>frontFace</code> and skip detection when <code>frontFaceSource</code> is set.
+            {snap.axisSaved && snap.savedFrontFace
+              ? snap.savedFrontFace === "+z"
+                ? "Saved +Z. That side is already forward, so the GLB is not rotated. Pick +X to turn the current +X side onto +Z."
+                : `Saved ${snap.savedFrontFace.toUpperCase()}. Download turns that side onto +Z.`
+              : "Pick +X to turn the current +X side onto +Z, then Save and Download."}
           </p>
         </section>
       </aside>

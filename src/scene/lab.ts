@@ -7,6 +7,7 @@ import {
   GizmoManager,
   HemisphericLight,
   Matrix,
+  Mesh,
   MeshBuilder,
   PointerEventTypes,
   Quaternion,
@@ -22,14 +23,13 @@ import {
 import { GridMaterial } from "@babylonjs/materials";
 import { GLTF2Export } from "@babylonjs/serializers";
 import "@babylonjs/loaders/glTF";
-import JSZip from "jszip";
 import { scoreFrontFaceSamples, type FrontFaceSample } from "../logic/detectFrontFace";
 import {
   DEFAULT_ROOM_OBJECT_FRONT_FACE,
+  FRONT_FACE_WALL_YAW,
   type RoomObjectFrontFace,
   type RoomWallId,
 } from "../logic/frontFace";
-import { buildObjectMetadata } from "../logic/metadata";
 import {
   TEST_ROOM,
   TEST_ROOM_INTERIOR,
@@ -39,6 +39,7 @@ import {
   checkFloorSnap,
   checkWallSnap,
   extentsFromSamples,
+  rotateExtentsYaw,
   sizeOfExtents,
   translateExtents,
   type ObjectLocalExtents,
@@ -80,6 +81,9 @@ export interface LabSnapshot {
   validated: boolean;
   wallSnapPass: boolean;
   floorSnapPass: boolean;
+  savedFrontFace: RoomObjectFrontFace | null;
+  axisSaved: boolean;
+  downloading: boolean;
 }
 
 const EMPTY_SCORES: Record<RoomObjectFrontFace, number> = {
@@ -121,6 +125,9 @@ export function emptySnapshot(): LabSnapshot {
     validated: false,
     wallSnapPass: false,
     floorSnapPass: false,
+    savedFrontFace: null,
+    axisSaved: false,
+    downloading: false,
   };
 }
 
@@ -139,7 +146,59 @@ function downloadBlob(blob: Blob, filename: string): void {
   anchor.href = url;
   anchor.download = filename;
   anchor.click();
-  URL.revokeObjectURL(url);
+  window.setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+interface MeshExportState {
+  mesh: Mesh;
+  parent: Mesh["parent"];
+  position: Vector3;
+  rotation: Vector3;
+  rotationQuaternion: Quaternion | null;
+  scaling: Vector3;
+  pivot: Matrix;
+  positions: number[];
+  normals: number[] | null;
+  tangents: number[] | null;
+  indices: number[] | null;
+}
+
+function copyVertexData(data: ArrayLike<number> | null): number[] | null {
+  return data ? Array.from(data) : null;
+}
+
+function snapshotMesh(mesh: Mesh): MeshExportState {
+  const positions = mesh.getVerticesData(VertexBuffer.PositionKind);
+  if (!positions) throw new Error(`Mesh ${mesh.name} has no positions.`);
+  return {
+    mesh,
+    parent: mesh.parent,
+    position: mesh.position.clone(),
+    rotation: mesh.rotation.clone(),
+    rotationQuaternion: mesh.rotationQuaternion?.clone() ?? null,
+    scaling: mesh.scaling.clone(),
+    pivot: mesh.getPivotMatrix().clone(),
+    positions: Array.from(positions),
+    normals: copyVertexData(mesh.getVerticesData(VertexBuffer.NormalKind)),
+    tangents: copyVertexData(mesh.getVerticesData(VertexBuffer.TangentKind)),
+    indices: copyVertexData(mesh.getIndices()),
+  };
+}
+
+function restoreMesh(state: MeshExportState): void {
+  const { mesh } = state;
+  mesh.setVerticesData(VertexBuffer.PositionKind, state.positions, true);
+  if (state.normals) mesh.setVerticesData(VertexBuffer.NormalKind, state.normals, true);
+  if (state.tangents) mesh.setVerticesData(VertexBuffer.TangentKind, state.tangents, true);
+  if (state.indices) mesh.setIndices(state.indices);
+  mesh.parent = state.parent;
+  mesh.position.copyFrom(state.position);
+  mesh.rotation.copyFrom(state.rotation);
+  mesh.rotationQuaternion = state.rotationQuaternion;
+  mesh.scaling.copyFrom(state.scaling);
+  mesh.setPivotMatrix(state.pivot);
+  mesh.refreshBoundingInfo({});
+  mesh.computeWorldMatrix(true);
 }
 
 export class ObjectLab {
@@ -153,9 +212,7 @@ export class ObjectLab {
   private readonly localAxes: TransformNode;
   private readonly arrow: AbstractMesh;
   private readonly label: AbstractMesh;
-  private file: File | null = null;
   private extents: ObjectLocalExtents | null = null;
-  private translation: Vec3 = { x: 0, y: 0, z: 0 };
   private snapshot: LabSnapshot = emptySnapshot();
   private disposed = false;
   private beforeRender: Observer<Scene> | null = null;
@@ -420,6 +477,8 @@ export class ObjectLab {
 
   private clearObject(): void {
     this.gizmos.attachToNode(null);
+    this.localAxes.parent = this.objectRoot;
+    this.frontRoot.parent = this.objectRoot;
     this.content?.dispose(false, true);
     this.content = null;
     this.extents = null;
@@ -437,7 +496,6 @@ export class ObjectLab {
       this.patch({ status: "error", error: "Only .glb files can be loaded.", progress: 0 });
       return;
     }
-    this.file = file;
     this.clearObject();
     this.snapshot = {
       ...emptySnapshot(),
@@ -482,18 +540,16 @@ export class ObjectLab {
         return;
       }
       const offset = alignmentOffset(raw);
-      this.translation = offset;
       this.applyRootLocalOffset(content, meshes, new Vector3(offset.x, offset.y, offset.z));
       const aligned = translateExtents(raw, offset);
       this.extents = aligned;
 
       const detection = scoreFrontFaceSamples(samples);
-      const size = sizeOfExtents(aligned);
       this.objectRoot.rotationQuaternion = null;
       this.objectRoot.rotation.set(0, 0, 0);
       this.objectRoot.scaling.set(1, 1, 1);
-      const floor = buildFloorPlacement(TEST_ROOM, aligned, 1);
-      this.applyPose(floor.position, floor.rotationY);
+      this.localAxes.parent = content;
+      this.frontRoot.parent = content;
 
       this.snapshot = {
         ...emptySnapshot(),
@@ -507,24 +563,16 @@ export class ObjectLab {
         confidence: detection.confidence,
         needsConfirm: detection.needsConfirm,
         scores: detection.scores,
-        dimensionsM: size,
-        dimensionsMm: {
-          width: Math.round(size.width * 1000),
-          height: Math.round(size.height * 1000),
-          depth: Math.round(size.depth * 1000),
-        },
-        boundsMin: { x: aligned.minX, y: aligned.minY, z: aligned.minZ },
-        boundsMax: { x: aligned.maxX, y: aligned.maxY, z: aligned.maxZ },
-        center: {
-          x: (aligned.minX + aligned.maxX) * 0.5,
-          y: (aligned.minY + aligned.maxY) * 0.5,
-          z: (aligned.minZ + aligned.maxZ) * 0.5,
-        },
         origin: { x: 0, y: 0, z: 0 },
         translation: offset,
         gizmo: this.snapshot.gizmo,
         scale: 1,
       };
+      this.applyFrontYaw();
+      const oriented = this.orientedExtents() ?? aligned;
+      const floor = buildFloorPlacement(TEST_ROOM, oriented, 1);
+      this.applyPose(floor.position, floor.rotationY);
+      Object.assign(this.snapshot, this.dimensionPatch(oriented));
       this.localAxes.setEnabled(true);
       this.updateFrontIndicator();
       this.frameCamera();
@@ -602,6 +650,39 @@ export class ObjectLab {
     return this.objectRoot.scaling.x || 1;
   }
 
+  private orientedExtents(): ObjectLocalExtents | null {
+    if (!this.extents) return null;
+    return rotateExtentsYaw(this.extents, FRONT_FACE_WALL_YAW[this.snapshot.frontFace]);
+  }
+
+  private dimensionPatch(extents: ObjectLocalExtents): Partial<LabSnapshot> {
+    const size = sizeOfExtents(extents);
+    return {
+      dimensionsM: size,
+      dimensionsMm: {
+        width: Math.round(size.width * 1000),
+        height: Math.round(size.height * 1000),
+        depth: Math.round(size.depth * 1000),
+      },
+      boundsMin: { x: extents.minX, y: extents.minY, z: extents.minZ },
+      boundsMax: { x: extents.maxX, y: extents.maxY, z: extents.maxZ },
+      center: {
+        x: (extents.minX + extents.maxX) * 0.5,
+        y: (extents.minY + extents.maxY) * 0.5,
+        z: (extents.minZ + extents.maxZ) * 0.5,
+      },
+    };
+  }
+
+  /** Turn the picked local axis onto +Z. +Z itself is a no-op. */
+  private applyFrontYaw(): void {
+    if (!this.content) return;
+    const yaw = (FRONT_FACE_WALL_YAW[this.snapshot.frontFace] * Math.PI) / 180;
+    this.content.rotationQuaternion = null;
+    this.content.rotation.set(0, yaw, 0);
+    this.content.computeWorldMatrix(true);
+  }
+
   private updateFrontIndicator(): void {
     if (!this.extents) {
       this.frontRoot.setEnabled(false);
@@ -653,18 +734,23 @@ export class ObjectLab {
       tested: emptyTested(),
       wallSnapPass: false,
       floorSnapPass: false,
+      axisSaved: this.snapshot.savedFrontFace === face,
     });
+    this.applyFrontYaw();
+    const oriented = this.orientedExtents();
+    if (oriented) this.patch(this.dimensionPatch(oriented));
     this.updateFrontIndicator();
     if (was && was !== "floor") this.snapWall(was);
     else if (was === "floor") this.snapFloor();
   }
 
   snapWall(wallId: RoomWallId): void {
-    if (!this.extents || this.snapshot.status !== "ready") return;
+    const extents = this.orientedExtents();
+    if (!extents || this.snapshot.status !== "ready") return;
     const scale = this.currentScale();
-    const pose = buildWallPlacement(wallId, TEST_ROOM, this.extents, this.snapshot.frontFace, scale);
+    const pose = buildWallPlacement(wallId, TEST_ROOM, extents, "+z", scale);
     this.applyPose(pose.position, pose.rotationY);
-    const check = checkWallSnap(wallId, pose.position, pose.rotationY, this.extents, TEST_ROOM, scale);
+    const check = checkWallSnap(wallId, pose.position, pose.rotationY, extents, TEST_ROOM, scale);
     this.patch({
       activeSnap: wallId,
       scale,
@@ -674,11 +760,12 @@ export class ObjectLab {
   }
 
   snapFloor(): void {
-    if (!this.extents || this.snapshot.status !== "ready") return;
+    const extents = this.orientedExtents();
+    if (!extents || this.snapshot.status !== "ready") return;
     const scale = this.currentScale();
-    const pose = buildFloorPlacement(TEST_ROOM, this.extents, scale);
+    const pose = buildFloorPlacement(TEST_ROOM, extents, scale);
     this.applyPose(pose.position, pose.rotationY);
-    const check = checkFloorSnap(pose.position, pose.rotationY, this.extents, TEST_ROOM, scale);
+    const check = checkFloorSnap(pose.position, pose.rotationY, extents, TEST_ROOM, scale);
     this.patch({
       activeSnap: "floor",
       scale,
@@ -688,24 +775,25 @@ export class ObjectLab {
   }
 
   async validate(): Promise<void> {
-    if (!this.extents || this.snapshot.status !== "ready" || this.snapshot.validating) return;
+    const extents = this.orientedExtents();
+    if (!extents || this.snapshot.status !== "ready" || this.snapshot.validating) return;
     this.patch({ validating: true, validated: false });
     const scale = this.currentScale();
     const tested = emptyTested();
     let wallSnapPass = true;
     for (const wall of ["front", "back", "left", "right"] as const) {
-      const pose = buildWallPlacement(wall, TEST_ROOM, this.extents, this.snapshot.frontFace, scale);
+      const pose = buildWallPlacement(wall, TEST_ROOM, extents, "+z", scale);
       this.applyPose(pose.position, pose.rotationY);
-      const check = checkWallSnap(wall, pose.position, pose.rotationY, this.extents, TEST_ROOM, scale);
+      const check = checkWallSnap(wall, pose.position, pose.rotationY, extents, TEST_ROOM, scale);
       tested[wall] = check.pass ? "pass" : "fail";
       if (!check.pass) wallSnapPass = false;
       this.patch({ activeSnap: wall, tested: { ...tested }, scale });
       await this.wait(380);
       if (this.disposed) return;
     }
-    const floor = buildFloorPlacement(TEST_ROOM, this.extents, scale);
+    const floor = buildFloorPlacement(TEST_ROOM, extents, scale);
     this.applyPose(floor.position, floor.rotationY);
-    const floorCheck = checkFloorSnap(floor.position, floor.rotationY, this.extents, TEST_ROOM, scale);
+    const floorCheck = checkFloorSnap(floor.position, floor.rotationY, extents, TEST_ROOM, scale);
     tested.floor = floorCheck.pass ? "pass" : "fail";
     const frontReady = this.snapshot.frontFaceSource === "manual" || !this.snapshot.needsConfirm;
     const validated = wallSnapPass && floorCheck.pass && frontReady && this.snapshot.vertices > 0;
@@ -726,76 +814,81 @@ export class ObjectLab {
     });
   }
 
-  private metadataName(): string {
-    const raw = this.snapshot.fileName ?? "object";
-    return raw.replace(/\.glb$/i, "");
-  }
-
-  private buildMetadata() {
-    if (!this.extents) throw new Error("No model loaded.");
-    return buildObjectMetadata({
-      name: this.metadataName(),
-      frontFace: this.snapshot.frontFace,
-      frontFaceSource: this.snapshot.frontFaceSource,
-      confidence: this.snapshot.confidence,
-      wallSnap: this.snapshot.wallSnapPass,
-      floorSnap: this.snapshot.floorSnapPass,
-      localExtents: this.extents,
-      translationMeters: this.translation,
+  saveAxis(): void {
+    if (!this.extents || this.snapshot.status !== "ready") return;
+    this.patch({
+      savedFrontFace: this.snapshot.frontFace,
+      axisSaved: true,
+      error: null,
     });
   }
 
-  async saveConfiguration(): Promise<void> {
-    if (!this.snapshot.validated) return;
-    const json = JSON.stringify(this.buildMetadata(), null, 2);
-    downloadBlob(new Blob([json], { type: "application/json" }), "object.json");
-  }
+  async downloadGlb(): Promise<void> {
+    const face = this.snapshot.savedFrontFace;
+    const content = this.content;
+    if (!this.snapshot.axisSaved || !face || !content || this.snapshot.downloading) return;
 
-  async exportPackage(): Promise<void> {
-    if (!this.snapshot.validated || !this.file || !this.content) return;
-    const savedPos = this.objectRoot.position.clone();
-    const savedRot = this.objectRoot.rotation.clone();
-    const savedScale = this.objectRoot.scaling.clone();
-    this.objectRoot.rotationQuaternion = null;
-    this.objectRoot.position.set(0, 0, 0);
-    this.objectRoot.rotation.set(0, 0, 0);
-    this.objectRoot.scaling.set(1, 1, 1);
+    const meshes = content
+      .getChildMeshes(false)
+      .filter((mesh): mesh is Mesh => mesh instanceof Mesh && isVisualMesh(mesh));
+    if (meshes.length === 0) {
+      this.patch({ error: "No geometry to export." });
+      return;
+    }
+
+    content.computeWorldMatrix(true);
+    const inverseContent = Matrix.Invert(content.getWorldMatrix());
+    const yaw = Matrix.RotationY((FRONT_FACE_WALL_YAW[face] * Math.PI) / 180);
+    const savedContentRot = content.rotation.clone();
+    const savedContentQuat = content.rotationQuaternion?.clone() ?? null;
+    const snapshots = meshes.map((mesh) => {
+      mesh.computeWorldMatrix(true);
+      const toContent = mesh.getWorldMatrix().multiply(inverseContent);
+      return { mesh, baked: toContent.multiply(yaw), state: snapshotMesh(mesh) };
+    });
+
     this.frontRoot.setEnabled(false);
+    this.localAxes.setEnabled(false);
     this.gizmos.attachToNode(null);
-    this.objectRoot.computeWorldMatrix(true);
+    this.patch({ downloading: true, error: null });
 
     try {
+      for (const { mesh, baked } of snapshots) {
+        mesh.makeGeometryUnique();
+        mesh.bakeTransformIntoVertices(baked);
+        mesh.parent = content;
+        mesh.position.set(0, 0, 0);
+        mesh.rotation.set(0, 0, 0);
+        mesh.rotationQuaternion = null;
+        mesh.scaling.set(1, 1, 1);
+        mesh.setPivotMatrix(Matrix.Identity());
+        mesh.computeWorldMatrix(true);
+      }
+      content.rotationQuaternion = null;
+      content.rotation.set(0, 0, 0);
+      content.computeWorldMatrix(true);
+      const keep = new Set<Mesh>(meshes);
       const result = await GLTF2Export.GLBAsync(this.scene, "object", {
-        shouldExportNode: (node) => {
-          if (node.name.includes(HELPER)) return false;
-          if (node === this.content) return true;
-          let current: TransformNode | null = node.parent as TransformNode | null;
-          while (current) {
-            if (current === this.content) return true;
-            current = current.parent as TransformNode | null;
-          }
-          return false;
-        },
+        shouldExportNode: (node) => node === content || keep.has(node as Mesh),
       });
       const exported = result.glTFFiles["object.glb"];
+      if (!exported) throw new Error("Exporter did not return a GLB.");
       const glbBlob =
-        exported instanceof Blob
-          ? exported
-          : new Blob([exported], { type: "model/gltf-binary" });
-      const zip = new JSZip();
-      zip.file("object.glb", glbBlob);
-      zip.file("object.json", JSON.stringify(this.buildMetadata(), null, 2));
-      const packed = await zip.generateAsync({ type: "blob" });
-      downloadBlob(packed, `${this.metadataName()}-validated.zip`);
+        exported instanceof Blob ? exported : new Blob([exported], { type: "model/gltf-binary" });
+      const base = (this.snapshot.fileName ?? "object.glb").replace(/\.glb$/i, "");
+      downloadBlob(glbBlob, `${base}.glb`);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Export failed.";
+      const message = error instanceof Error ? error.message : "Download failed.";
       this.patch({ error: message });
     } finally {
-      this.objectRoot.position.copyFrom(savedPos);
-      this.objectRoot.rotation.copyFrom(savedRot);
-      this.objectRoot.scaling.copyFrom(savedScale);
-      this.frontRoot.setEnabled(true);
+      for (const { state } of snapshots) restoreMesh(state);
+      content.rotation.copyFrom(savedContentRot);
+      content.rotationQuaternion = savedContentQuat;
+      content.computeWorldMatrix(true);
+      this.localAxes.setEnabled(true);
+      this.updateFrontIndicator();
       if (this.snapshot.gizmo !== "camera") this.gizmos.attachToNode(this.objectRoot);
+      this.patch({ downloading: false });
     }
   }
 

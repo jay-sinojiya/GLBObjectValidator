@@ -8,6 +8,7 @@ import {
   checkFloorSnap,
   checkWallSnap,
   computeWorldAabbFromRoot,
+  rotateExtentsYaw,
 } from "./placementMath";
 
 function boxSamples(
@@ -111,6 +112,16 @@ describe("placement", () => {
       const pose = buildWallPlacement(wall, TEST_ROOM, CABINET, "+x");
       expect(checkWallSnap(wall, pose.position, pose.rotationY, CABINET, TEST_ROOM).pass).toBe(true);
     }
+  });
+});
+
+describe("rotateExtentsYaw", () => {
+  it("turns the +X extent onto +Z", () => {
+    const turned = rotateExtentsYaw({ minX: -1.5, minY: 0, minZ: -0.3, maxX: 1.5, maxY: 1, maxZ: 0.3 }, -90);
+    expect(turned.minX).toBeCloseTo(-0.3);
+    expect(turned.maxX).toBeCloseTo(0.3);
+    expect(turned.minZ).toBeCloseTo(-1.5);
+    expect(turned.maxZ).toBeCloseTo(1.5);
   });
 });
 

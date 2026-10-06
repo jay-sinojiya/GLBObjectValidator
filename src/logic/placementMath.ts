@@ -397,6 +397,29 @@ export function alignmentOffset(local: ObjectLocalExtents): Vec3 {
   };
 }
 
+/** Yaw an AABB with the same Y rotation Babylon applies to a mesh. */
+export function rotateExtentsYaw(local: ObjectLocalExtents, yawDeg: number): ObjectLocalExtents {
+  const rad = (yawDeg * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+  if (Math.abs(sin) < 1e-8 && Math.abs(cos - 1) < 1e-8) return local;
+  let minX = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let minZ = Number.POSITIVE_INFINITY;
+  let maxZ = Number.NEGATIVE_INFINITY;
+  for (const x of [local.minX, local.maxX]) {
+    for (const z of [local.minZ, local.maxZ]) {
+      const rx = x * cos + z * sin;
+      const rz = -x * sin + z * cos;
+      if (rx < minX) minX = rx;
+      if (rx > maxX) maxX = rx;
+      if (rz < minZ) minZ = rz;
+      if (rz > maxZ) maxZ = rz;
+    }
+  }
+  return { minX, minY: local.minY, minZ, maxX, maxY: local.maxY, maxZ };
+}
+
 export function translateExtents(local: ObjectLocalExtents, offset: Vec3): ObjectLocalExtents {
   return {
     minX: local.minX + offset.x,
