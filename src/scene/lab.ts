@@ -26,10 +26,10 @@ import "@babylonjs/loaders/glTF";
 import { scoreFrontFaceSamples, type FrontFaceSample } from "../logic/detectFrontFace";
 import {
   DEFAULT_ROOM_OBJECT_FRONT_FACE,
-  FRONT_FACE_WALL_YAW,
   type RoomObjectFrontFace,
   type RoomWallId,
 } from "../logic/frontFace";
+import { yawPitchForFace, type TurnAxis, type TurnFace } from "../logic/turn";
 import {
   TEST_ROOM,
   TEST_ROOM_INTERIOR,
@@ -37,9 +37,9 @@ import {
   buildFloorPlacement,
   buildWallPlacement,
   checkFloorSnap,
+  computeWorldAabbFromRoot,
   checkWallSnap,
   extentsFromSamples,
-  rotateExtentsYaw,
   sizeOfExtents,
   translateExtents,
   type ObjectLocalExtents,
@@ -62,7 +62,7 @@ export interface LabSnapshot {
   fileSize: number | null;
   vertices: number;
   frontFace: RoomObjectFrontFace;
-  frontFaceSource: "auto" | "manual";
+  frontFaceSource: "auto" | "manual" | "baked";
   confidence: number;
   needsConfirm: boolean;
   scores: Record<RoomObjectFrontFace, number>;
@@ -81,7 +81,18 @@ export interface LabSnapshot {
   validated: boolean;
   wallSnapPass: boolean;
   floorSnapPass: boolean;
-  savedFrontFace: RoomObjectFrontFace | null;
+  qx: number;
+  qy: number;
+  qz: number;
+  qw: number;
+  turnFace: TurnFace;
+  upFace: TurnFace;
+  savedQx: number | null;
+  savedQy: number | null;
+  savedQz: number | null;
+  savedQw: number | null;
+  savedTurnFace: TurnFace | null;
+  savedUpFace: TurnFace | null;
   axisSaved: boolean;
   downloading: boolean;
 }
@@ -125,10 +136,67 @@ export function emptySnapshot(): LabSnapshot {
     validated: false,
     wallSnapPass: false,
     floorSnapPass: false,
-    savedFrontFace: null,
+    qx: 0,
+    qy: 0,
+    qz: 0,
+    qw: 1,
+    turnFace: "+z",
+    upFace: "+y",
+    savedQx: null,
+    savedQy: null,
+    savedQz: null,
+    savedQw: null,
+    savedTurnFace: null,
+    savedUpFace: null,
     axisSaved: false,
     downloading: false,
   };
+}
+
+function metadataLocksWallFront(metadata: unknown): boolean {
+  if (!metadata || typeof metadata !== "object") return false;
+  const record = metadata as Record<string, unknown>;
+  if (record.roomWallFront === "+z") return true;
+  const gltf = record.gltf;
+  if (!gltf || typeof gltf !== "object") return false;
+  const extras = (gltf as Record<string, unknown>).extras;
+  return !!extras && typeof extras === "object" && (extras as Record<string, unknown>).roomWallFront === "+z";
+}
+
+function subtreeLocksWallFront(nodes: Array<{ metadata?: unknown; getChildren?: () => unknown[] }>): boolean {
+  const seen = new Set<object>();
+  const stack = [...nodes];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (!node || seen.has(node)) continue;
+    seen.add(node);
+    if (metadataLocksWallFront(node.metadata)) return true;
+    const children = typeof node.getChildren === "function" ? node.getChildren() : [];
+    for (const child of children) {
+      if (child && typeof child === "object") stack.push(child as (typeof nodes)[number]);
+    }
+  }
+  return false;
+}
+
+/** Downloaded validator GLBs store `roomWallFront: "+z"` in the JSON chunk. */
+function glbLocksWallFront(data: Uint8Array): boolean {
+  if (data.byteLength < 20) return false;
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  if (view.getUint32(0, true) !== 0x46546c67) return false;
+  let offset = 12;
+  while (offset + 8 <= data.byteLength) {
+    const length = view.getUint32(offset, true);
+    const type = view.getUint32(offset + 4, true);
+    offset += 8;
+    if (offset + length > data.byteLength) return false;
+    if (type === 0x4e4f534a) {
+      const json = new TextDecoder().decode(data.subarray(offset, offset + length));
+      return json.includes('"roomWallFront"');
+    }
+    offset += length;
+  }
+  return false;
 }
 
 function isVisualMesh(mesh: AbstractMesh): boolean {
@@ -138,6 +206,57 @@ function isVisualMesh(mesh: AbstractMesh): boolean {
     !mesh.name.endsWith("__pick") &&
     !mesh.name.includes(HELPER)
   );
+}
+
+function faceQuaternion(face: TurnFace): Quaternion {
+  const { yaw, pitch } = yawPitchForFace(face);
+  return Quaternion.RotationYawPitchRoll((yaw * Math.PI) / 180, (pitch * Math.PI) / 180, 0);
+}
+
+function dominantAxis(v: Vector3): TurnFace {
+  const ax = Math.abs(v.x);
+  const ay = Math.abs(v.y);
+  const az = Math.abs(v.z);
+  if (ay >= ax && ay >= az) return v.y >= 0 ? "+y" : "-y";
+  if (ax >= az) return v.x >= 0 ? "+x" : "-x";
+  return v.z >= 0 ? "+z" : "-z";
+}
+
+function axesOf(q: Quaternion): { turnFace: TurnFace; upFace: TurnFace } {
+  const inverse = q.conjugate();
+  return {
+    turnFace: dominantAxis(new Vector3(0, 0, 1).applyRotationQuaternion(inverse)),
+    upFace: dominantAxis(new Vector3(0, 1, 0).applyRotationQuaternion(inverse)),
+  };
+}
+
+function sameRotation(a: Quaternion, b: Quaternion): boolean {
+  const dot = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+  return Math.abs(Math.abs(dot) - 1) < 1e-4;
+}
+
+function rotateExtentsQuaternion(local: ObjectLocalExtents, q: Quaternion): ObjectLocalExtents {
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let minZ = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  let maxZ = Number.NEGATIVE_INFINITY;
+  const out = new Vector3();
+  for (const x of [local.minX, local.maxX]) {
+    for (const y of [local.minY, local.maxY]) {
+      for (const z of [local.minZ, local.maxZ]) {
+        new Vector3(x, y, z).rotateByQuaternionToRef(q, out);
+        if (out.x < minX) minX = out.x;
+        if (out.y < minY) minY = out.y;
+        if (out.z < minZ) minZ = out.z;
+        if (out.x > maxX) maxX = out.x;
+        if (out.y > maxY) maxY = out.y;
+        if (out.z > maxZ) maxZ = out.z;
+      }
+    }
+  }
+  return { minX, minY, minZ, maxX, maxY, maxZ };
 }
 
 function downloadBlob(blob: Blob, filename: string): void {
@@ -386,8 +505,43 @@ export class ObjectLab {
       if (axis === "x") mesh.rotation.z = -Math.PI / 2;
       if (axis === "z") mesh.rotation.x = Math.PI / 2;
       mesh.position[axis] = length * 0.5;
+      const tip = Vector3.Zero();
+      tip[axis] = length * 0.92;
+      if (axis === "y") tip.x = 0.14;
+      else tip.y = 0.12;
+      this.axisName(`+${axis.toUpperCase()}`, color, tip, root);
     }
     return root;
+  }
+
+  private axisName(text: string, color: Color3, position: Vector3, parent: TransformNode): void {
+    const plane = MeshBuilder.CreatePlane(`axis-name-${text}${HELPER}`, { width: 0.36, height: 0.16 }, this.scene);
+    plane.parent = parent;
+    plane.position.copyFrom(position);
+    plane.billboardMode = 7;
+    plane.renderingGroupId = 1;
+    plane.isPickable = false;
+    const tex = new DynamicTexture(`axis-tex-${text}`, { width: 256, height: 128 }, this.scene, false);
+    tex.hasAlpha = true;
+    const paint = tex.getContext() as CanvasRenderingContext2D;
+    paint.clearRect(0, 0, 256, 128);
+    paint.font = "bold 80px sans-serif";
+    paint.textAlign = "center";
+    paint.textBaseline = "middle";
+    paint.lineWidth = 10;
+    paint.strokeStyle = "rgba(8,10,12,0.9)";
+    paint.strokeText(text, 128, 64);
+    paint.fillStyle = `rgb(${Math.round(color.r * 255)}, ${Math.round(color.g * 255)}, ${Math.round(color.b * 255)})`;
+    paint.fillText(text, 128, 64);
+    tex.update();
+    const mat = new StandardMaterial(`axis-mat-${text}`, this.scene);
+    mat.diffuseTexture = tex;
+    mat.emissiveTexture = tex;
+    mat.opacityTexture = tex;
+    mat.emissiveColor = Color3.White();
+    mat.backFaceCulling = false;
+    mat.disableLighting = true;
+    plane.material = mat;
   }
 
   private wallLabel(text: string, position: Vector3, rotationY: number): void {
@@ -418,19 +572,19 @@ export class ObjectLab {
   private buildFrontIndicator(): { arrow: AbstractMesh; label: AbstractMesh } {
     const shaft = MeshBuilder.CreateCylinder(
       `front-shaft${HELPER}`,
-      { height: 0.72, diameter: 0.045, tessellation: 12 },
+      { height: 0.28, diameter: 0.03, tessellation: 12 },
       this.scene
     );
     shaft.rotation.x = Math.PI / 2;
-    shaft.position.z = 0.36;
+    shaft.position.z = 0.16;
     shaft.parent = this.frontRoot;
     const head = MeshBuilder.CreateCylinder(
       `front-head${HELPER}`,
-      { height: 0.22, diameterTop: 0, diameterBottom: 0.16, tessellation: 12 },
+      { height: 0.1, diameterTop: 0, diameterBottom: 0.09, tessellation: 12 },
       this.scene
     );
     head.rotation.x = Math.PI / 2;
-    head.position.z = 0.83;
+    head.position.z = 0.34;
     head.parent = this.frontRoot;
     const mat = new StandardMaterial("front-arrow-mat", this.scene);
     mat.diffuseColor = new Color3(0.95, 0.62, 0.1);
@@ -441,9 +595,9 @@ export class ObjectLab {
     shaft.isPickable = false;
     head.isPickable = false;
 
-    const plane = MeshBuilder.CreatePlane(`front-label${HELPER}`, { width: 0.7, height: 0.28 }, this.scene);
+    const plane = MeshBuilder.CreatePlane(`front-label${HELPER}`, { width: 0.34, height: 0.12 }, this.scene);
     plane.parent = this.frontRoot;
-    plane.position.set(0, 0.28, 0.45);
+    plane.position.set(0, 0.22, 0.12);
     plane.billboardMode = 7;
     plane.isPickable = false;
     const tex = new DynamicTexture("front-label-tex", { width: 512, height: 200 }, this.scene, false);
@@ -507,6 +661,7 @@ export class ObjectLab {
     };
     this.emit();
 
+    const lockedWallFront = glbLocksWallFront(new Uint8Array(await file.arrayBuffer()));
     const url = URL.createObjectURL(file);
     try {
       const container = await SceneLoader.LoadAssetContainerAsync("", url, this.scene, (event) => {
@@ -544,7 +699,10 @@ export class ObjectLab {
       const aligned = translateExtents(raw, offset);
       this.extents = aligned;
 
-      const detection = scoreFrontFaceSamples(samples);
+      const baked = lockedWallFront || subtreeLocksWallFront(container.rootNodes);
+      const detection = baked ? null : scoreFrontFaceSamples(samples);
+      const turn = detection ? faceQuaternion(detection.frontFace) : Quaternion.Identity();
+      const turned = axesOf(turn);
       this.objectRoot.rotationQuaternion = null;
       this.objectRoot.rotation.set(0, 0, 0);
       this.objectRoot.scaling.set(1, 1, 1);
@@ -558,17 +716,30 @@ export class ObjectLab {
         fileName: file.name,
         fileSize: file.size,
         vertices,
-        frontFace: detection.frontFace,
-        frontFaceSource: "auto",
-        confidence: detection.confidence,
-        needsConfirm: detection.needsConfirm,
-        scores: detection.scores,
+        frontFace: detection?.frontFace ?? "+z",
+        frontFaceSource: baked ? "baked" : "auto",
+        confidence: detection?.confidence ?? 1,
+        needsConfirm: detection?.needsConfirm ?? false,
+        scores: detection?.scores ?? { ...EMPTY_SCORES },
+        qx: turn.x,
+        qy: turn.y,
+        qz: turn.z,
+        qw: turn.w,
+        turnFace: turned.turnFace,
+        upFace: turned.upFace,
+        savedQx: baked ? turn.x : null,
+        savedQy: baked ? turn.y : null,
+        savedQz: baked ? turn.z : null,
+        savedQw: baked ? turn.w : null,
+        savedTurnFace: baked ? turned.turnFace : null,
+        savedUpFace: baked ? turned.upFace : null,
+        axisSaved: baked,
         origin: { x: 0, y: 0, z: 0 },
         translation: offset,
         gizmo: this.snapshot.gizmo,
         scale: 1,
       };
-      this.applyFrontYaw();
+      this.applyTurn();
       const oriented = this.orientedExtents() ?? aligned;
       const floor = buildFloorPlacement(TEST_ROOM, oriented, 1);
       this.applyPose(floor.position, floor.rotationY);
@@ -650,9 +821,19 @@ export class ObjectLab {
     return this.objectRoot.scaling.x || 1;
   }
 
+  private currentTurn(): Quaternion {
+    return new Quaternion(this.snapshot.qx, this.snapshot.qy, this.snapshot.qz, this.snapshot.qw);
+  }
+
+  private savedTurn(): Quaternion | null {
+    const { savedQx, savedQy, savedQz, savedQw } = this.snapshot;
+    if (savedQx == null || savedQy == null || savedQz == null || savedQw == null) return null;
+    return new Quaternion(savedQx, savedQy, savedQz, savedQw);
+  }
+
   private orientedExtents(): ObjectLocalExtents | null {
     if (!this.extents) return null;
-    return rotateExtentsYaw(this.extents, FRONT_FACE_WALL_YAW[this.snapshot.frontFace]);
+    return rotateExtentsQuaternion(this.extents, this.currentTurn());
   }
 
   private dimensionPatch(extents: ObjectLocalExtents): Partial<LabSnapshot> {
@@ -674,12 +855,10 @@ export class ObjectLab {
     };
   }
 
-  /** Turn the picked local axis onto +Z. +Z itself is a no-op. */
-  private applyFrontYaw(): void {
+  private applyTurn(): void {
     if (!this.content) return;
-    const yaw = (FRONT_FACE_WALL_YAW[this.snapshot.frontFace] * Math.PI) / 180;
-    this.content.rotationQuaternion = null;
-    this.content.rotation.set(0, yaw, 0);
+    this.content.rotationQuaternion = this.currentTurn();
+    this.content.rotation.set(0, 0, 0);
     this.content.computeWorldMatrix(true);
   }
 
@@ -688,22 +867,29 @@ export class ObjectLab {
       this.frontRoot.setEnabled(false);
       return;
     }
-    const face = this.snapshot.frontFace;
+    const face = this.snapshot.turnFace;
     const dir =
       face === "+x"
         ? new Vector3(1, 0, 0)
         : face === "-x"
           ? new Vector3(-1, 0, 0)
-          : face === "+z"
-            ? new Vector3(0, 0, 1)
-            : new Vector3(0, 0, -1);
+          : face === "+y"
+            ? new Vector3(0, 1, 0)
+            : face === "-y"
+              ? new Vector3(0, -1, 0)
+              : face === "+z"
+                ? new Vector3(0, 0, 1)
+                : new Vector3(0, 0, -1);
     const half =
       face === "+x" || face === "-x"
         ? (this.extents.maxX - this.extents.minX) * 0.5
-        : (this.extents.maxZ - this.extents.minZ) * 0.5;
+        : face === "+y" || face === "-y"
+          ? (this.extents.maxY - this.extents.minY) * 0.5
+          : (this.extents.maxZ - this.extents.minZ) * 0.5;
     const midY = (this.extents.minY + this.extents.maxY) * 0.5;
     this.frontRoot.position.set(dir.x * (half + 0.15), midY, dir.z * (half + 0.15));
-    this.frontRoot.rotationQuaternion = Quaternion.FromLookDirectionLH(dir, Vector3.Up());
+    const upHint = face === "+y" || face === "-y" ? Vector3.Forward() : Vector3.Up();
+    this.frontRoot.rotationQuaternion = Quaternion.FromLookDirectionLH(dir, upHint);
     this.frontRoot.setEnabled(true);
     this.arrow.isVisible = true;
     this.label.isVisible = true;
@@ -723,25 +909,47 @@ export class ObjectLab {
     this.camera.beta = 1.1;
   }
 
-  setFrontFace(face: RoomObjectFrontFace): void {
+  setTurnFace(face: TurnFace): void {
     if (!this.extents || this.snapshot.status !== "ready") return;
+    this.publishTurn(faceQuaternion(face));
+  }
+
+  rotateAround(axis: TurnAxis, deltaDeg: number): void {
+    if (!this.extents || this.snapshot.status !== "ready") return;
+    const direction = axis === "x" ? Vector3.Right() : axis === "y" ? Vector3.Up() : Vector3.Forward();
+    const delta = Quaternion.RotationAxis(direction, (deltaDeg * Math.PI) / 180);
+    this.publishTurn(delta.multiply(this.currentTurn()));
+  }
+
+  private publishTurn(q: Quaternion): void {
     const was = this.snapshot.activeSnap;
+    const axes = axesOf(q);
     this.patch({
-      frontFace: face,
+      qx: q.x,
+      qy: q.y,
+      qz: q.z,
+      qw: q.w,
+      turnFace: axes.turnFace,
+      upFace: axes.upFace,
       frontFaceSource: "manual",
       needsConfirm: false,
       validated: false,
       tested: emptyTested(),
       wallSnapPass: false,
       floorSnapPass: false,
-      axisSaved: this.snapshot.savedFrontFace === face,
+      axisSaved: this.turnMatches(q),
     });
-    this.applyFrontYaw();
+    this.applyTurn();
     const oriented = this.orientedExtents();
     if (oriented) this.patch(this.dimensionPatch(oriented));
     this.updateFrontIndicator();
     if (was && was !== "floor") this.snapWall(was);
     else if (was === "floor") this.snapFloor();
+  }
+
+  private turnMatches(q: Quaternion): boolean {
+    const saved = this.savedTurn();
+    return saved != null && sameRotation(saved, q);
   }
 
   snapWall(wallId: RoomWallId): void {
@@ -751,12 +959,32 @@ export class ObjectLab {
     const pose = buildWallPlacement(wallId, TEST_ROOM, extents, "+z", scale);
     this.applyPose(pose.position, pose.rotationY);
     const check = checkWallSnap(wallId, pose.position, pose.rotationY, extents, TEST_ROOM, scale);
+    this.frameWallFace(wallId, pose.position, pose.rotationY, extents, scale);
     this.patch({
       activeSnap: wallId,
       scale,
       tested: { ...this.snapshot.tested, [wallId]: check.pass ? "pass" : "fail" },
       validated: false,
     });
+  }
+
+  /** Camera stands inside the room and looks at the face local +Z presents on this wall. */
+  private frameWallFace(
+    wallId: RoomWallId,
+    position: Vec3,
+    rotationY: number,
+    extents: ObjectLocalExtents,
+    scale: number
+  ): void {
+    const aabb = computeWorldAabbFromRoot(position, rotationY, extents, scale);
+    const span = Math.max(aabb.maxX - aabb.minX, aabb.maxY - aabb.minY, aabb.maxZ - aabb.minZ, 0.4);
+    this.camera.setTarget(
+      new Vector3((aabb.minX + aabb.maxX) * 0.5, (aabb.minY + aabb.maxY) * 0.5, (aabb.minZ + aabb.maxZ) * 0.5)
+    );
+    this.camera.radius = Math.min(12, Math.max(3.6, span * 4.5));
+    this.camera.beta = 1.2;
+    this.camera.alpha =
+      wallId === "back" ? Math.PI / 2 : wallId === "front" ? -Math.PI / 2 : wallId === "left" ? 0 : Math.PI;
   }
 
   snapFloor(): void {
@@ -817,16 +1045,21 @@ export class ObjectLab {
   saveAxis(): void {
     if (!this.extents || this.snapshot.status !== "ready") return;
     this.patch({
-      savedFrontFace: this.snapshot.frontFace,
+      savedQx: this.snapshot.qx,
+      savedQy: this.snapshot.qy,
+      savedQz: this.snapshot.qz,
+      savedQw: this.snapshot.qw,
+      savedTurnFace: this.snapshot.turnFace,
+      savedUpFace: this.snapshot.upFace,
       axisSaved: true,
       error: null,
     });
   }
 
   async downloadGlb(): Promise<void> {
-    const face = this.snapshot.savedFrontFace;
+    const saved = this.savedTurn();
     const content = this.content;
-    if (!this.snapshot.axisSaved || !face || !content || this.snapshot.downloading) return;
+    if (!this.snapshot.axisSaved || !saved || !content || this.snapshot.downloading) return;
 
     const meshes = content
       .getChildMeshes(false)
@@ -838,19 +1071,29 @@ export class ObjectLab {
 
     content.computeWorldMatrix(true);
     const inverseContent = Matrix.Invert(content.getWorldMatrix());
-    const yaw = Matrix.RotationY((FRONT_FACE_WALL_YAW[face] * Math.PI) / 180);
+    const orient = new Matrix();
+    Matrix.FromQuaternionToRef(saved, orient);
     const savedContentRot = content.rotation.clone();
     const savedContentQuat = content.rotationQuaternion?.clone() ?? null;
     const snapshots = meshes.map((mesh) => {
       mesh.computeWorldMatrix(true);
       const toContent = mesh.getWorldMatrix().multiply(inverseContent);
-      return { mesh, baked: toContent.multiply(yaw), state: snapshotMesh(mesh) };
+      return { mesh, baked: toContent.multiply(orient), state: snapshotMesh(mesh) };
     });
 
     this.frontRoot.setEnabled(false);
     this.localAxes.setEnabled(false);
     this.gizmos.attachToNode(null);
     this.patch({ downloading: true, error: null });
+
+    const wallFrontMeta = { gltf: { extras: { roomWallFront: "+z" } } };
+    const previousMeta = new Map<TransformNode, unknown>();
+    previousMeta.set(content, content.metadata);
+    content.metadata = wallFrontMeta;
+    for (const mesh of meshes) {
+      previousMeta.set(mesh, mesh.metadata);
+      mesh.metadata = wallFrontMeta;
+    }
 
     try {
       for (const { mesh, baked } of snapshots) {
@@ -881,6 +1124,7 @@ export class ObjectLab {
       const message = error instanceof Error ? error.message : "Download failed.";
       this.patch({ error: message });
     } finally {
+      for (const [node, metadata] of previousMeta) node.metadata = metadata;
       for (const { state } of snapshots) restoreMesh(state);
       content.rotation.copyFrom(savedContentRot);
       content.rotationQuaternion = savedContentQuat;

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { ROOM_OBJECT_FRONT_FACES, type RoomObjectFrontFace, type RoomWallId } from "./logic/frontFace";
+import type { RoomWallId } from "./logic/frontFace";
+import { TURN_FACES, type TurnAxis, type TurnFace } from "./logic/turn";
 import { ObjectLab, emptySnapshot, type GizmoMode, type LabSnapshot, type SnapId } from "./scene/lab";
 
 const WALLS: { id: RoomWallId; label: string }[] = [
@@ -174,28 +175,68 @@ export function App() {
           {ready && snap.needsConfirm && snap.frontFaceSource === "auto" && (
             <p className="confirm">Please confirm the object's front direction.</p>
           )}
-          <div className="axis-row">
-            {ROOM_OBJECT_FRONT_FACES.map((face) => (
+          <div className="faces">
+            {TURN_FACES.map((face) => (
               <button
                 key={face}
                 type="button"
                 disabled={!ready}
-                className={snap.frontFace === face ? "on" : ""}
-                onClick={() => labRef.current?.setFrontFace(face as RoomObjectFrontFace)}
+                className={snap.turnFace === face ? "on" : ""}
+                onClick={() => labRef.current?.setTurnFace(face as TurnFace)}
               >
                 {face.toUpperCase()}
               </button>
             ))}
           </div>
           <p className="hint">
+            {ready && snap.frontFaceSource === "baked"
+              ? "This file already has the wall face baked. Snap a wall — that face is the one you saved. Rotate only if it is still wrong."
+              : ready
+                ? `Front ${snap.turnFace.toUpperCase()} · up ${snap.upFace.toUpperCase()}. Source ${snap.frontFaceSource} · confidence ${(snap.confidence * 100).toFixed(0)}%.`
+                : "Upload a model to detect a front axis."}
+          </p>
+        </section>
+
+        <section>
+          <h2>Rotate object</h2>
+          <div className="turns">
+          {([
+            ["x", "X"],
+            ["y", "Y"],
+            ["z", "Z"],
+          ] as const).map(([axis, label]) => (
+            <div className="pair" key={axis}>
+              <button
+                type="button"
+                disabled={!ready || snap.validating}
+                onClick={() => labRef.current?.rotateAround(axis as TurnAxis, -90)}
+              >
+                {label} −90°
+              </button>
+              <button
+                type="button"
+                disabled={!ready || snap.validating}
+                onClick={() => labRef.current?.rotateAround(axis as TurnAxis, 90)}
+              >
+                {label} +90°
+              </button>
+            </div>
+          ))}
+          </div>
+          <p className="hint">
             {ready
-              ? `Source ${snap.frontFaceSource} · confidence ${(snap.confidence * 100).toFixed(0)}%. The lit button is the side that gets turned onto +Z. +Z itself does not rotate.`
-              : "Upload a model to detect a front axis."}
+              ? "6 faces, 4 ups each: 24 orientations. X tips it, Y turns it, Z rolls it."
+              : "Upload a model to rotate it."}
           </p>
         </section>
 
         <section>
           <h2>Wall snap</h2>
+          <p className="hint">
+            {ready && snap.activeSnap && snap.activeSnap !== "floor"
+              ? `Camera is inside the room, looking at the ${snap.activeSnap} wall. That face is what users see. Change it until it is right, then Save and Download.`
+              : "Snap a wall. The camera shows the face that will face into the room."}
+          </p>
           <div className="stack">
             {WALLS.map((wall) => (
               <button key={wall.id} type="button" disabled={!ready || snap.validating} onClick={() => labRef.current?.snapWall(wall.id)}>
@@ -225,7 +266,7 @@ export function App() {
             </li>
           </ul>
           <p>
-            Front axis: <strong>{ready ? snap.frontFace.toUpperCase() : "—"}</strong>
+            Front axis: <strong>{ready ? `${snap.turnFace.toUpperCase()} up ${snap.upFace.toUpperCase()}` : "—"}</strong>
           </p>
           <p>
             Wall snap: <strong>{snap.wallSnapPass ? "PASS" : "—"}</strong>
@@ -257,11 +298,9 @@ export function App() {
             {snap.downloading ? "Downloading…" : "Download"}
           </button>
           <p className="hint">
-            {snap.axisSaved && snap.savedFrontFace
-              ? snap.savedFrontFace === "+z"
-                ? "Saved +Z. That side is already forward, so the GLB is not rotated. Pick +X to turn the current +X side onto +Z."
-                : `Saved ${snap.savedFrontFace.toUpperCase()}. Download turns that side onto +Z.`
-              : "Pick +X to turn the current +X side onto +Z, then Save and Download."}
+            {snap.axisSaved && snap.savedTurnFace && snap.savedUpFace
+              ? `Saved front ${snap.savedTurnFace.toUpperCase()}, up ${snap.savedUpFace.toUpperCase()}. Download bakes that face onto +Z so every wall snap shows it.`
+              : "Pick a face or rotate, click Save, then Download."}
           </p>
         </section>
       </aside>

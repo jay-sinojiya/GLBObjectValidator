@@ -184,6 +184,12 @@ button.on, button.primary {
 
 .axis-row { grid-template-columns: repeat(4, 1fr); }
 
+.faces { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+
+.turns { display: grid; gap: 6px; }
+
 .confirm {
   background: #3d320f;
   color: #ffd56a;
